@@ -1,11 +1,20 @@
 package main
 
 import (
+	"bufio"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 )
 
 // 获取head
@@ -134,4 +143,98 @@ func PathType(path string) string {
 		return "other" // 或者也可以返回 "file"，取决于你的具体需求
 
 	}
+}
+
+// deriveKey 从密码派生AES密钥
+func deriveKey(password string) []byte {
+	hash := sha256.Sum256([]byte(password))
+	return hash[:] // 返回32字节用于AES-256
+}
+
+// encryptData 加密数据
+func encryptData(data []byte, password string) ([]byte, error) {
+	key := deriveKey(password)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonce := make([]byte, aesgcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+
+	ciphertext := aesgcm.Seal(nonce, nonce, data, nil)
+	return ciphertext, nil
+}
+
+// decryptData 解密数据
+func decryptData(data []byte, password string) ([]byte, error) {
+	key := deriveKey(password)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := aesgcm.NonceSize()
+	if len(data) < nonceSize {
+		return nil, fmt.Errorf("密文太短")
+	}
+
+	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
+	plaintext, err := aesgcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return plaintext, nil
+}
+
+// readPassword 从控制台读取密码
+func readPassword(prompt string) string {
+	fmt.Print(prompt)
+	reader := bufio.NewReader(os.Stdin)
+	password, _ := reader.ReadString('\n')
+	return strings.TrimSpace(password)
+}
+
+// parseProjectFromURL 从远程URL路径中解析项目名（最后一级路径）
+func parseProjectFromURL(remoteUrl string) string {
+	u, err := url.Parse(remoteUrl)
+	if err != nil || u.Path == "" {
+		trimmed := strings.TrimSuffix(remoteUrl, "/")
+		parts := strings.Split(trimmed, "/")
+		if len(parts) == 0 {
+			return ""
+		}
+		return parts[len(parts)-1]
+	}
+	p := strings.TrimSuffix(u.Path, "/")
+	if p == "" {
+		return ""
+	}
+	return path.Base(p)
+}
+
+// LoadCommit 读取commit对象
+func LoadCommit(manager *LocalManager, hash string) (*HeadObj, error) {
+	data, err := manager.GetBlob(hash)
+	if err != nil {
+		return nil, err
+	}
+	var head HeadObj
+	if err := json.Unmarshal(data, &head); err != nil {
+		return nil, err
+	}
+	return &head, nil
 }

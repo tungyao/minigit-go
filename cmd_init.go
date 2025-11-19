@@ -20,5 +20,10 @@ func CmdInit(args []string) error {
 	if err != nil {
 		return err
 	}
+	// 初始化提交索引文件（commits），写入空数组，便于后续快速读取
+	commitsFile, err := manager.GetCommitsFile()
+	if err == nil {
+		_ = os.WriteFile(commitsFile, []byte("[]"), 0644)
+	}
 	return nil
 }

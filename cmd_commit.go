@@ -109,6 +109,41 @@ func CmdCommit(args []string) {
 		return
 	}
 
+	// 添加提交到commits文件
+	err = manager.AddCommit(commitHash, message, commit.Timestamp)
+	if err != nil {
+		log.Printf("Warning: failed to add commit to commits file: %v", err)
+		// 不致命，继续
+	}
+
+	// 提交后重置暂存区状态：将所有文件的状态重置为正常（非新增/修改/删除），
+	// 保持文件列表，这样后续的add操作可以正确检测删除的文件
+	resetTrees := make([]Tree, len(trees))
+	for i, tree := range trees {
+		// 跳过删除的文件，不保留到新的index中
+		if tree.Status == StatusDelete {
+			continue
+		}
+		resetTrees[i] = Tree{
+			Hash:      tree.Hash,
+			Path:      tree.Path,
+			Name:      tree.Name,
+			Timestamp: tree.Timestamp,
+			Status:    StatusAdd, // 保持为已添加状态，表示文件已被跟踪
+		}
+	}
+	// 过滤掉nil
+	var filteredTrees []Tree
+	for _, tree := range resetTrees {
+		if tree.Path != "" {
+			filteredTrees = append(filteredTrees, tree)
+		}
+	}
+	if err := manager.FlushIndex(filteredTrees); err != nil {
+		log.Printf("Error resetting index after commit: %v", err)
+		// 不致命，继续
+	}
+
 	// 输出结果
 	log.Printf("Committed successfully!")
 	log.Printf("Commit hash: %s", commitHash)
@@ -148,11 +183,6 @@ func checkIfHasChanges(manager *LocalManager, parentHash string, currentTrees []
 		return true, nil // 如果读取失败,假设有变更
 	}
 
-	// 对比文件数量
-	if len(currentTrees) != len(parentCommit.Trees) {
-		return true, nil
-	}
-
 	// 创建map便于对比
 	parentMap := make(map[string]Tree)
 	for _, tree := range parentCommit.Trees {
@@ -161,6 +191,10 @@ func checkIfHasChanges(manager *LocalManager, parentHash string, currentTrees []
 
 	// 检查每个文件
 	for _, currentTree := range currentTrees {
+		if currentTree.Status == StatusDelete {
+			// 有文件被删除
+			return true, nil
+		}
 		parentTree, exists := parentMap[currentTree.Path]
 		if !exists {
 			// 新文件
@@ -172,16 +206,13 @@ func checkIfHasChanges(manager *LocalManager, parentHash string, currentTrees []
 		}
 	}
 
-	// 检查是否有文件被删除
+	// 检查是否有文件被删除（在父commit中存在，但在当前index中不存在且没有删除状态）
+	currentMap := make(map[string]Tree)
+	for _, tree := range currentTrees {
+		currentMap[tree.Path] = tree
+	}
 	for path := range parentMap {
-		found := false
-		for _, currentTree := range currentTrees {
-			if currentTree.Path == path {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if _, exists := currentMap[path]; !exists {
 			// 有文件被删除
 			return true, nil
 		}

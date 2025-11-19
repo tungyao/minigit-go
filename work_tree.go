@@ -87,6 +87,9 @@ func (w *WorkTree) ScanFiles(paths []string) ([]Tree, error) {
 				// 扫描目录中所有文件(包括已跟踪和新文件)
 				trees := w.scanDirectoryFull(relPath, indexMap, processed)
 				result = append(result, trees...)
+				// 检查该目录下已跟踪但被删除的文件
+				deletedTrees := w.findDeletedFilesInDirectory(relPath, indexMap, processed)
+				result = append(result, deletedTrees...)
 			} else {
 				// 目录不在index中,添加整个目录的所有文件
 				log.Printf("Adding new directory %s", relPath)
@@ -166,6 +169,11 @@ func (w *WorkTree) saveFileBlob(filePath string, hash string) error {
 
 // hasFilesInDirectory 检查index中是否有该目录下的文件
 func (w *WorkTree) hasFilesInDirectory(dirPath string, indexMap map[string]Tree) bool {
+	// 处理当前目录的情况
+	if dirPath == "." {
+		return len(indexMap) > 0
+	}
+
 	for path := range indexMap {
 		// 检查path是否在dirPath目录下
 		if filepath.Dir(path) == dirPath || path == dirPath {
@@ -532,29 +540,58 @@ func (w *WorkTree) deepScanDirectory(dirPath string, indexMap map[string]Tree, p
 	return result
 }
 
-// MergeIndexWithTrees 将新的trees合并到index中
+// findDeletedFilesInDirectory 查找目录下已跟踪但被删除的文件
+func (w *WorkTree) findDeletedFilesInDirectory(dirPath string, indexMap map[string]Tree, processed map[string]bool) []Tree {
+	result := make([]Tree, 0)
+
+	// 遍历index中该目录下的所有文件
+	for path, oldTree := range indexMap {
+		// 如果已经处理过,跳过
+		if processed[path] {
+			continue
+		}
+
+		// 检查文件是否在指定目录下
+		if dirPath == "." {
+			// 当前目录,检查所有文件
+		} else {
+			relPath, err := filepath.Rel(dirPath, path)
+			if err != nil || filepath.IsAbs(relPath) || strings.HasPrefix(relPath, "..") {
+				continue
+			}
+		}
+
+		// 检查文件是否还存在
+		pathType := PathType(path)
+		if pathType == "" {
+			// 文件已被删除
+			oldTree.Status = StatusDelete
+			result = append(result, oldTree)
+			processed[path] = true
+		}
+	}
+
+	return result
+}
+
+// MergeIndexWithTrees 将新的trees合并到index中（累积模式：多次 add 的变更都会保留）
 func (w *WorkTree) MergeIndexWithTrees(newTrees []Tree) ([]Tree, error) {
 	indexMap, err := w.GetIndexMap()
 	if err != nil {
 		return nil, err
 	}
 
-	// 合并新的trees到indexMap
+	// 将本次扫描的变更写入暂存区：
+	// - 新增/修改：覆盖写入
+	// - 删除：保留删除记录（不要直接从暂存区移除），以便在 commit 时生效
 	for _, tree := range newTrees {
-		if tree.Status == StatusDelete {
-			// 删除文件
-			delete(indexMap, tree.Path)
-		} else {
-			// 新增或修改文件
-			indexMap[tree.Path] = tree
-		}
+		indexMap[tree.Path] = tree
 	}
 
-	// 转换为数组
+	// 转换为数组返回
 	result := make([]Tree, 0, len(indexMap))
 	for _, tree := range indexMap {
 		result = append(result, tree)
 	}
-
 	return result, nil
 }

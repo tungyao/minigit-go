@@ -24,5 +24,6 @@ type HeadObj struct {
 // 对于配置文件 config 的结构定义
 // 用于push和pull操作
 type Conf struct {
-	Remote map[string]string
+	Remote   map[string]string // name -> url
+	Password map[string]string // name -> password
 }

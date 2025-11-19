@@ -146,25 +146,33 @@ func CmdReset(args []string) {
 }
 
 // performHardReset 执行hard reset操作
-// 1. 更新HEAD指向目标提交
-// 2. 更新index为目标提交的trees
-// 3. 恢复工作区文件到目标提交的状态
+// 1. 先读取旧索引（在更新前）
+// 2. 更新HEAD指向目标提交
+// 3. 更新index为目标提交的trees
+// 4. 恢复工作区文件到目标提交的状态
 func performHardReset(manager *LocalManager, targetHash string, targetCommit *HeadObj) error {
-	// 1. 更新HEAD
-	err := manager.FlushHead(targetHash)
-	if err != nil {
+	// 1. 先读取旧的暂存区索引（在更新前），用于删除在目标提交中不存在的文件
+	workTree := NewWorkTree(manager)
+	oldIndexMap, _ := workTree.GetIndexMap()
+	log.Printf("Old index has %d files", len(oldIndexMap))
+
+	// 2. 更新HEAD
+	if err := manager.FlushHead(targetHash); err != nil {
 		return err
 	}
 
-	// 2. 更新index
-	err = manager.FlushIndex(targetCommit.Trees)
+	// 3. 构建完整快照（遍历历史提交，收集所有未删除的文件）
+	completeSnapshot, err := buildCompleteSnapshot(manager, targetHash, targetCommit)
 	if err != nil {
 		return err
 	}
+	log.Printf("Target commit complete snapshot has %d files", len(completeSnapshot))
+	if err := manager.FlushIndex(completeSnapshot); err != nil {
+		return err
+	}
 
-	// 3. 恢复工作区文件
-	err = restoreWorkingDirectory(manager, targetCommit.Trees)
-	if err != nil {
+	// 4. 恢复工作区：删除旧索引中存在但目标提交不存在的文件，并写入目标提交的文件
+	if err := restoreWorkingDirectoryWithDiff(manager, completeSnapshot, oldIndexMap); err != nil {
 		return err
 	}
 
@@ -182,18 +190,211 @@ func performSoftReset(manager *LocalManager, targetHash string, targetCommit *He
 		return err
 	}
 
-	// 2. 更新index
-	err = manager.FlushIndex(targetCommit.Trees)
+	// 2. 构建完整快照并更新index
+	completeSnapshot, err := buildCompleteSnapshot(manager, targetHash, targetCommit)
 	if err != nil {
 		return err
 	}
-
-	// soft模式不改变工作区
+	err = manager.FlushIndex(completeSnapshot)
 	log.Println("Working directory unchanged (soft mode)")
 	return nil
 }
 
-// restoreWorkingDirectory 恢复工作区到指定的trees状态
+// buildCompleteSnapshot 构建目标提交的完整快照
+// 从目标提交开始，向前遍历所有父提交，收集所有未被删除的文件
+// 这样可以还原出该提交时刻的完整文件状态
+func buildCompleteSnapshot(manager *LocalManager, targetHash string, targetCommit *HeadObj) ([]Tree, error) {
+	// 使用 map 存储文件状态，key 是文件路径
+	fileMap := make(map[string]*Tree)
+
+	// 从目标提交开始向前遍历
+	currentCommit := targetCommit
+
+	for {
+		// 处理当前提交的所有 trees
+		for _, tree := range currentCommit.Trees {
+			// 只处理尚未记录的文件（因为我们是从新到旧遍历，新的状态优先）
+			if _, exists := fileMap[tree.Path]; !exists {
+				if tree.Status == StatusDelete {
+					// 如果是删除操作，标记为已删除（不加入最终快照）
+					fileMap[tree.Path] = nil
+				} else {
+					// 添加或修改操作，记录文件信息
+					treeCopy := tree
+					fileMap[tree.Path] = &treeCopy
+				}
+			}
+		}
+
+		// 如果没有父提交，遍历结束
+		if currentCommit.ParentHash == "" {
+			break
+		}
+
+		// 加载父提交
+		parentCommit, err := loadCommitObject(manager, currentCommit.ParentHash)
+		if err != nil {
+			log.Printf("Warning: failed to load parent commit %s: %v", currentCommit.ParentHash, err)
+			break
+		}
+
+		currentCommit = parentCommit
+	}
+
+	// 构建最终快照（只包含未删除的文件）
+	result := make([]Tree, 0, len(fileMap))
+	for _, tree := range fileMap {
+		if tree != nil {
+			// 归一化状态为 StatusAdd（表示这是快照中的文件）
+			result = append(result, Tree{
+				Hash:      tree.Hash,
+				Path:      tree.Path,
+				Name:      tree.Name,
+				Timestamp: tree.Timestamp,
+				Status:    StatusAdd,
+			})
+		}
+	}
+
+	log.Printf("Built complete snapshot with %d files from commit history", len(result))
+	return result, nil
+}
+
+// normalizeTreesForSnapshot 将提交中的Trees归一为快照写入index
+// - 统一将 Status 设为 StatusAdd，避免旧提交中的 Modify/Delete 干扰当前index
+// - 保留 Path/Hash/Name/Timestamp 信息
+func normalizeTreesForSnapshot(trees []Tree) []Tree {
+	result := make([]Tree, 0, len(trees))
+	for _, t := range trees {
+		result = append(result, Tree{
+			Hash:      t.Hash,
+			Path:      t.Path,
+			Name:      t.Name,
+			Timestamp: t.Timestamp,
+			Status:    StatusAdd,
+		})
+	}
+	return result
+}
+
+// restoreWorkingDirectoryWithDiff 根据目标提交与旧索引的差异恢复工作区
+// - 扫描工作区，删除所有不在目标提交中的文件（包括未跟踪的文件）
+// - 写入目标提交中的所有文件（无论本地是否存在）
+func restoreWorkingDirectoryWithDiff(manager *LocalManager, targetTrees []Tree, oldIndexMap map[string]Tree) error {
+	root, err := manager.GetRoot()
+	if err != nil {
+		return err
+	}
+
+	// 目标集合
+	targetSet := make(map[string]bool)
+	for _, t := range targetTrees {
+		targetSet[t.Path] = true
+	}
+
+	// 1. 扫描工作区，删除所有不在目标提交中的文件
+	deletedCount := 0
+	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // 忽略错误，继续
+		}
+
+		// 跳过.minigit目录
+		if info.IsDir() && info.Name() == Mark {
+			return filepath.SkipDir
+		}
+
+		// 跳过目录
+		if info.IsDir() {
+			return nil
+		}
+
+		// 获取相对路径
+		relPath, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil
+		}
+
+		// 如果文件不在目标集合中，删除它
+		if !targetSet[relPath] {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				log.Printf("Warning: failed to remove file %s: %v", relPath, err)
+			} else if err == nil {
+				log.Printf("Deleted: %s", relPath)
+				deletedCount++
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		log.Printf("Warning: error walking directory: %v", err)
+	}
+
+	if deletedCount > 0 {
+		log.Printf("Deleted %d file(s) not in target commit", deletedCount)
+	}
+
+	// 2. 写入目标提交中的所有文件（无论本地是否存在都要恢复）
+	restoredCount := 0
+	for _, tree := range targetTrees {
+		content, err := manager.GetBlob(tree.Hash)
+		if err != nil {
+			log.Printf("Error: failed to read blob for %s: %v", tree.Path, err)
+			return err
+		}
+		fullPath := filepath.Join(root, tree.Path)
+		dir := filepath.Dir(fullPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			log.Printf("Error: failed to create directory for %s: %v", tree.Path, err)
+			return err
+		}
+		// 强制写入文件，恢复到目标提交的状态
+		if err := os.WriteFile(fullPath, content, 0644); err != nil {
+			log.Printf("Error: failed to restore file %s: %v", tree.Path, err)
+			return err
+		}
+		log.Printf("Restored: %s", tree.Path)
+		restoredCount++
+	}
+	log.Printf("Restored %d file(s) from target commit", restoredCount)
+
+	return nil
+}
+
+// restoreWorkingDirectoryFromSnapshot 从快照恢复工作区（用于clone/pull后恢复文件）
+// 直接写入所有文件，不删除任何文件
+func restoreWorkingDirectoryFromSnapshot(manager *LocalManager, snapshot []Tree) error {
+	root, err := manager.GetRoot()
+	if err != nil {
+		return err
+	}
+
+	// 写入快照中的所有文件
+	for _, tree := range snapshot {
+		content, err := manager.GetBlob(tree.Hash)
+		if err != nil {
+			log.Printf("Error: failed to read blob for %s: %v", tree.Path, err)
+			return err
+		}
+		fullPath := filepath.Join(root, tree.Path)
+		dir := filepath.Dir(fullPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			log.Printf("Error: failed to create directory for %s: %v", tree.Path, err)
+			return err
+		}
+		// 写入文件
+		if err := os.WriteFile(fullPath, content, 0644); err != nil {
+			log.Printf("Error: failed to restore file %s: %v", tree.Path, err)
+			return err
+		}
+		log.Printf("Restored: %s", tree.Path)
+	}
+
+	return nil
+}
+
 func restoreWorkingDirectory(manager *LocalManager, trees []Tree) error {
 	root, err := manager.GetRoot()
 	if err != nil {

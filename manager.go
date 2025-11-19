@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"log"
 	"os"
 )
 
@@ -14,7 +13,7 @@ type LocalManager struct{}
 
 func (l *LocalManager) GetRoot() (string, error) {
 	root, err := os.Getwd()
-	log.Println("root:", root)
+	// log.Println("root:", root)
 	return root, err
 }
 func (m *LocalManager) GetHead() (string, error) {
@@ -112,4 +111,84 @@ func (m *LocalManager) GetBlob(hash string) ([]byte, error) {
 
 	objectPath := root + "/" + Mark + "/objects/" + hash[:2] + "/" + hash[2:]
 	return os.ReadFile(objectPath)
+}
+
+// GetCommitsFile 获取commits文件路径
+func (m *LocalManager) GetCommitsFile() (string, error) {
+	root, err := m.GetRoot()
+	if err != nil {
+		return "", err
+	}
+	return root + "/" + Mark + "/commits", nil
+}
+
+// CommitRef 提交引用信息
+type CommitRef struct {
+	Hash      string `json:"hash"`
+	Message   string `json:"message"`
+	Timestamp string `json:"timestamp"`
+}
+
+// GetAllCommits 获取所有提交引用
+func (m *LocalManager) GetAllCommits() ([]CommitRef, error) {
+	commitsFile, err := m.GetCommitsFile()
+	if err != nil {
+		return nil, err
+	}
+
+	content, err := os.ReadFile(commitsFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []CommitRef{}, nil
+		}
+		return nil, err
+	}
+
+	if len(content) == 0 {
+		return []CommitRef{}, nil
+	}
+
+	var commits []CommitRef
+	err = json.Unmarshal(content, &commits)
+	if err != nil {
+		return nil, err
+	}
+
+	return commits, nil
+}
+
+// AddCommit 添加新提交到commits文件
+func (m *LocalManager) AddCommit(hash, message, timestamp string) error {
+	commits, err := m.GetAllCommits()
+	if err != nil {
+		return err
+	}
+
+	// 检查是否已存在
+	for _, commit := range commits {
+		if commit.Hash == hash {
+			return nil // 已存在，不重复添加
+		}
+	}
+
+	// 添加新提交（插入到开头，最新的在前）
+	newCommit := CommitRef{
+		Hash:      hash,
+		Message:   message,
+		Timestamp: timestamp,
+	}
+	commits = append([]CommitRef{newCommit}, commits...)
+
+	// 保存到文件
+	commitsFile, err := m.GetCommitsFile()
+	if err != nil {
+		return err
+	}
+
+	prettyJSON, err := json.MarshalIndent(commits, "", "    ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(commitsFile, prettyJSON, 0644)
 }

@@ -26,6 +26,14 @@ func main() {
 		CmdLog(args[2:])
 	case "reset":
 		CmdReset(args[2:])
+	case "clone":
+		CmdClone(args[2:])
+	case "server":
+		CmdServer(args[2:])
+	case "push":
+		CmdPush(args[2:])
+	case "pull":
+		CmdPull(args[2:])
 	case "remote":
 		CmdRemote(args[2:])
 	default:
