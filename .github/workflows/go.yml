@@ -1,0 +1,58 @@
+name: Build Go Binary (Manual)
+
+# 触发条件：手动触发 (Workflow Dispatch)
+on: 
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build for ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      # 使用矩阵策略并行编译三个版本
+      matrix:
+        include:
+          # 1. Linux 64-bit
+          - os: linux
+            arch: amd64
+            output_ext: "" 
+          # 2. Linux Aarch64 (ARM64)
+          - os: linux
+            arch: arm64
+            output_ext: ""
+          # 3. Windows 64-bit
+          - os: windows
+            arch: amd64
+            output_ext: ".exe"
+
+    steps:
+      # 第一步：检出代码
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 第二步：安装 Go 环境
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable' # 或者指定具体的版本，如 '1.21'
+
+      # 第三步：执行编译
+      - name: Build Binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0 # 禁用 CGO 以确保静态链接，更容易跨平台
+        run: |
+          echo "Building for ${{ matrix.os }}/${{ matrix.arch }}..."
+          # 编译命令，输出文件名为 gg (Windows会自动补全.exe)
+          go build -v -o gg${{ matrix.output_ext }} .
+
+      # 第四步：上传编译产物
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # 上传后的压缩包名称，用以区分不同平台
+          name: gg-${{ matrix.os }}-${{ matrix.arch }}
+          # 要上传的文件路径
+          path: gg${{ matrix.output_ext }}
+          retention-days: 5 # 文件保留5天
