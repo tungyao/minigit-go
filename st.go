@@ -2,6 +2,7 @@ package main
 
 // 状态常量定义
 const (
+	StatusNormal = 0 // 正常状态（已跟踪，未修改）
 	StatusAdd    = 1 // 新增文件
 	StatusModify = 2 // 修改文件
 	StatusDelete = 3 // 删除文件

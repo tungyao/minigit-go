@@ -71,13 +71,26 @@ func CmdPush(args []string) {
 		log.Printf("获取远程heads失败: %v", err)
 		return
 	}
-	// 如果远程不为空，校验本地HEAD是否与远程最新一致
-	if len(remoteHeads) > 0 {
+	// 如果远程不为空，校验本地提交历史是否包含远程最新commit
+	// 这样可以允许本地有新提交推送，但拒绝历史分叉的情况
+	if len(remoteHeads) > 0 && remoteLatest != "" {
 		localHead, _ := manager.GetHeadContent()
-		if localHead != remoteLatest {
-			log.Printf("推送被拒绝：本地HEAD(%s)不是远程最新(%s)，请先pull或reset到最新再推送", localHead, remoteLatest)
+		// 如果本地HEAD就是远程最新，说明本地没有新提交
+		if localHead == remoteLatest {
+			log.Println("本地已是最新，无需推送")
 			return
 		}
+		// 检查本地提交历史是否包含远程最新commit
+		containsRemote, err := localHistoryContains(manager, localHead, remoteLatest)
+		if err != nil {
+			log.Printf("检查提交历史失败: %v", err)
+			return
+		}
+		if !containsRemote {
+			log.Printf("推送被拒绝：本地提交历史不包含远程最新commit(%s)，历史已分叉，请先pull", remoteLatest)
+			return
+		}
+		log.Printf("验证通过：本地提交历史包含远程最新commit，允许推送")
 	}
 
 	// 找出需要推送的heads
@@ -273,4 +286,49 @@ func createLocalTar(manager *LocalManager, hashes []string) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+// localHistoryContains 检查本地提交历史中是否包含指定commit
+// 从 startHash 开始，向前回溯父提交，直到找到 targetHash 或到达根提交
+func localHistoryContains(manager *LocalManager, startHash, targetHash string) (bool, error) {
+	if startHash == "" || targetHash == "" {
+		return false, nil
+	}
+
+	// 如果开始就是目标，直接返回
+	if startHash == targetHash {
+		return true, nil
+	}
+
+	// BFS回溯父提交，避免重复访问
+	visited := make(map[string]bool)
+	queue := []string{startHash}
+	visited[startHash] = true
+
+	for len(queue) > 0 {
+		currentHash := queue[0]
+		queue = queue[1:]
+
+		// 加载commit对象
+		commit, err := LoadCommit(manager, currentHash)
+		if err != nil {
+			// 如果加载失败，继续处理下一个
+			log.Printf("加载commit %s 失败: %v", currentHash, err)
+			continue
+		}
+
+		// 检查父提交
+		if commit.ParentHash != "" {
+			if commit.ParentHash == targetHash {
+				return true, nil
+			}
+			if !visited[commit.ParentHash] {
+				visited[commit.ParentHash] = true
+				queue = append(queue, commit.ParentHash)
+			}
+		}
+	}
+
+	// 遵历完所有父提交都没找到
+	return false, nil
 }
